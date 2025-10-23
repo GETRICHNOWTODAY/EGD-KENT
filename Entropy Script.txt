@@ -1,0 +1,185 @@
+//@version=6
+indicator("Entropy Direction + 2×Kalman Innovation Entropy (LOCKED @ Open)", "EGD-KENT", overlay=true, max_bars_back=2000)
+
+// ── GLOBAL TOGGLES
+showEGD       = input.bool(true,  "Show EGD internals", inline="a")
+showKENT      = input.bool(true,  "Show K-Ent internals", inline="b")
+unified       = input.bool(false, "Unified: BOTH modules must agree")
+oneShotG      = input.bool(false, "One-shot (per module)")
+showDbg       = input.bool(true,  "Show debug ticks")
+showLiveMarks = input.bool(false, "Also plot LIVE (non-locked) CALL/PUT for comparison")
+lockMode      = input.bool(true,  "LOCK predictions at bar open (t-1 → t)")
+
+// ── HELPER
+bin_entropy(float p) =>
+    _p = na(p) ? 0.5 : p
+    pp = math.max(1e-9, math.min(1.0 - 1e-9, _p))
+    -(pp*math.log(pp) + (1.0-pp)*math.log(1.0-pp)) / math.log(2.0)
+
+// ============================================================================
+// A) EGD — Entropy-Gradient Direction
+// ============================================================================
+grpEGD = "A) EGD"
+winE     = input.int(20,  "Entropy Window (bars)", minval=10, group=grpEGD)
+smoothH  = input.int(3,   "Entropy EMA",           minval=1,  group=grpEGD)
+stabThr  = input.float(0.95, "Max Entropy allowed (0–1)", step=0.01, group=grpEGD)
+gradThr  = input.float(0.00, "Entropy gradient ≤ (falling if < 0)", step=0.01, group=grpEGD)
+biasLen  = input.int(5,   "Recent Bias Length", minval=1, group=grpEGD)
+
+// up/down Bernoulli stream → Shannon entropy (smoothed)
+egd_isUp   = close > close[1] ? 1.0 : 0.0
+egd_pUp    = ta.sma(egd_isUp, winE)
+egd_H_raw  = bin_entropy(egd_pUp)
+egd_H      = ta.ema(egd_H_raw, smoothH)
+egd_dH     = egd_H - egd_H[1]
+egd_ready  = bar_index >= winE + 5 and not na(egd_H) and not na(egd_dH)
+
+// short bias, stability, falling-uncertainty gates
+egd_recentBias = ta.sma(egd_isUp*2 - 1, biasLen)
+egd_biasUp  = egd_recentBias > 0
+egd_biasDn  = egd_recentBias < 0
+egd_stable  = egd_H <= stabThr
+egd_falling = egd_dH <= gradThr
+
+// raw module decisions (LIVE)
+egd_callRaw = egd_ready and egd_biasUp and egd_stable and egd_falling
+egd_putRaw  = egd_ready and egd_biasDn and egd_stable and egd_falling
+
+// one-shot gating
+EGD_CALL = oneShotG ? (egd_callRaw and not egd_callRaw[1]) : egd_callRaw
+EGD_PUT  = oneShotG ? (egd_putRaw  and not egd_putRaw[1])  : egd_putRaw
+
+// visuals
+plot(showEGD ? egd_H  : na, title="EGD Entropy (0–1)", color=color.new(color.purple,70))
+plot(showEGD ? egd_dH : na, title="EGD ΔEntropy",       color=color.new(color.orange,70))
+plotshape(showEGD and showLiveMarks and EGD_CALL, title="EGD CALL (LIVE)", style=shape.triangleup,   location=location.belowbar, color=color.lime, size=size.tiny, text="EGD")
+plotshape(showEGD and showLiveMarks and EGD_PUT,  title="EGD PUT (LIVE)",  style=shape.triangledown, location=location.abovebar, color=color.red,  size=size.tiny, text="EGD")
+plotchar(showDbg and showEGD and egd_ready,   title="EGD ready",   char='r', location=location.bottom, color=color.new(color.white,0), size=size.tiny)
+plotchar(showDbg and showEGD and egd_biasUp,  title="EGD biasUp",  char='↑', location=location.bottom, color=color.new(color.lime,0),  size=size.tiny)
+plotchar(showDbg and showEGD and egd_biasDn,  title="EGD biasDn",  char='↓', location=location.bottom, color=color.new(color.red,0),   size=size.tiny)
+plotchar(showDbg and showEGD and egd_stable,  title="EGD stable",  char='S', location=location.bottom, color=color.new(color.teal,0),  size=size.tiny)
+plotchar(showDbg and showEGD and egd_falling, title="EGD falling", char='F', location=location.bottom, color=color.new(color.orange,0),size=size.tiny)
+
+// ============================================================================
+// B) 2×Kalman Innovation Entropy (K-Ent)
+// ============================================================================
+grpKP = "B) Kalman on Price (α-β CV)"
+alphaP = input.float(0.25, "α (price)", step=0.01, minval=0, maxval=1, group=grpKP)
+betaP  = input.float(0.05, "β (price)", step=0.01, minval=0, maxval=1, group=grpKP)
+
+grpENT = "Innovation Entropy"
+varLen = input.int(20, "Innovation variance EMA", minval=2, group=grpENT)
+winN   = input.int(60, "Entropy norm window (bars)", minval=10, group=grpENT)
+
+grpKE = "Kalman on Entropy (α-β)"
+alphaE = input.float(0.35, "α (entropy)", step=0.01, minval=0, maxval=1, group=grpKE)
+betaE  = input.float(0.10, "β (entropy)", step=0.01, minval=0, maxval=1, group=grpKE)
+
+grpSIG = "K-Ent Signal / Gate"
+thrH   = input.float(0.40, "Max normalized entropy allowed", step=0.01, group=grpSIG)
+
+// α-β on price
+var float k_x = na
+var float k_v = 0.0
+var float k_r = na
+k_z = close
+
+if barstate.isfirst
+    k_x := k_z
+    k_v := 0.0
+    k_r := na
+else
+    k_x_pred = k_x + k_v
+    k_v_pred = k_v
+    k_r      := k_z - k_x_pred
+    k_x      := k_x_pred + alphaP * k_r
+    k_v      := k_v_pred + betaP  * k_r
+
+// innovation variance → differential entropy
+k_r2   = na(k_r) ? na : k_r*k_r
+k_sig2 = ta.ema(k_r2, varLen)
+k_hRaw = na(k_sig2) ? na : 0.5 * math.log(2.0 * math.pi * math.e * math.max(k_sig2, 1e-12))
+
+// α-β on entropy signal
+var float k_e  = na
+var float k_de = 0.0
+if barstate.isfirst
+    k_e  := na
+    k_de := 0.0
+else
+    k_e_pred  = na(k_e) ? k_hRaw : k_e + k_de
+    k_de_pred = k_de
+    k_re      = na(k_hRaw) or na(k_e_pred) ? na : (k_hRaw - k_e_pred)
+    k_e       := na(k_re) ? k_e_pred : k_e_pred + alphaE * k_re
+    k_de      := na(k_re) ? k_de_pred : k_de_pred + betaE  * k_re
+
+// normalize entropy 0..1
+k_eMin = ta.lowest(k_e, winN)
+k_eMax = ta.highest(k_e, winN)
+k_rng  = math.max(1e-12, k_eMax - k_eMin)
+k_Hn   = na(k_e) ? na : math.min(1.0, math.max(0.0, (k_e - k_eMin) / k_rng))
+k_dH   = k_Hn - k_Hn[1]
+
+// gates + direction
+k_slope   = k_x - k_x[1]
+k_stable  = k_Hn <= thrH
+k_falling = k_dH <= 0
+
+// raw module decisions (LIVE)
+k_callRaw = k_slope > 0 and k_stable and k_falling
+k_putRaw  = k_slope < 0 and k_stable and k_falling
+
+// one-shot gating
+K_CALL = oneShotG ? (k_callRaw and not k_callRaw[1]) : k_callRaw
+K_PUT  = oneShotG ? (k_putRaw  and not k_putRaw[1])  : k_putRaw
+
+// visuals
+plot(showKENT ? k_x  : na, "Kalman Price",        color=color.teal, linewidth=2)
+plot(showKENT ? k_Hn : na, "K-Ent Entropy (0..1)",color=color.new(color.purple,60))
+plot(showKENT ? k_dH : na, "K-Ent ΔEntropy",      color=color.new(color.orange,60))
+hline(showKENT ? thrH : na, "K-Ent Entropy Threshold", color=color.new(color.purple,40))
+plotshape(showKENT and showLiveMarks and K_CALL, title="K-Ent CALL (LIVE)", style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime,0),  size=size.tiny, text="K")
+plotshape(showKENT and showLiveMarks and K_PUT,  title="K-Ent PUT (LIVE)",  style=shape.triangledown, location=location.abovebar, color=color.new(color.red,0),   size=size.tiny, text="K")
+
+// ============================================================================
+// C) UNIFIED (LIVE) + LOCKED @ OPEN
+// ============================================================================
+// LIVE unified (optional)
+CALL_live = unified ? (EGD_CALL and K_CALL) : (EGD_CALL or K_CALL)
+PUT_live  = unified ? (EGD_PUT  and K_PUT ) : (EGD_PUT  or K_PUT )
+
+// draw live markers only when enabled (no local-scope plotting)
+plotshape(showLiveMarks and CALL_live, title="CALL (LIVE)", style=shape.labelup,   location=location.belowbar, color=color.new(color.lime,0), text="CALL (LIVE)", size=size.tiny)
+plotshape(showLiveMarks and PUT_live,  title="PUT  (LIVE)", style=shape.labeldown, location=location.abovebar, color=color.new(color.red,0),  text="PUT (LIVE)",  size=size.tiny)
+
+// LOCK AT BAR OPEN: use prior-bar decisions; avoid na() on bool by gating with bar_index
+EGD_CALL_LOCK = (bar_index > 0) ? EGD_CALL[1] : false
+EGD_PUT_LOCK  = (bar_index > 0) ? EGD_PUT[1]  : false
+K_CALL_LOCK   = (bar_index > 0) ? K_CALL[1]   : false
+K_PUT_LOCK    = (bar_index > 0) ? K_PUT[1]    : false
+
+CALL_lock = unified ? (EGD_CALL_LOCK and K_CALL_LOCK) : (EGD_CALL_LOCK or K_CALL_LOCK)
+PUT_lock  = unified ? (EGD_PUT_LOCK  and K_PUT_LOCK ) : (EGD_PUT_LOCK  or K_PUT_LOCK)
+
+// Final signals
+finalCALL = lockMode ? CALL_lock : CALL_live
+finalPUT  = lockMode ? PUT_lock  : PUT_live
+
+// Plots — const text only
+plotshape(lockMode and finalCALL, title="CALL (LOCK)", style=shape.labelup,   location=location.belowbar, color=color.new(color.lime,0), text="CALL (LOCK)", size=size.tiny)
+plotshape(not lockMode and finalCALL, title="CALL",     style=shape.labelup,   location=location.belowbar, color=color.new(color.lime,0), text="CALL",        size=size.tiny)
+plotshape(lockMode and finalPUT,  title="PUT (LOCK)",  style=shape.labeldown, location=location.abovebar, color=color.new(color.red,0),  text="PUT (LOCK)",  size=size.tiny)
+plotshape(not lockMode and finalPUT,  title="PUT",     style=shape.labeldown, location=location.abovebar, color=color.new(color.red,0),  text="PUT",         size=size.tiny)
+
+// Background tint for final signals (only when locked)
+bgcolor(lockMode ? (finalCALL ? color.new(color.lime,88) : finalPUT ? color.new(color.red,88) : na) : na)
+
+// Alerts — point to final signals
+alertcondition(finalCALL, "CALL (final)", "CALL signal (locked at open if enabled)")
+alertcondition(finalPUT,  "PUT  (final)", "PUT signal (locked at open if enabled)")
+
+// Optional module-only alerts
+alertcondition(EGD_CALL, "EGD CALL (module)", "EGD CALL (module, live)")
+alertcondition(EGD_PUT,  "EGD PUT  (module)", "EGD PUT  (module, live)")
+alertcondition(K_CALL,   "K-Ent CALL (module)", "K-Ent CALL (module, live)")
+alertcondition(K_PUT,    "K-Ent PUT  (module)", "K-Ent PUT  (module, live)")
